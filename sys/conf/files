@@ -1043,3 +1043,6 @@ file lib/libz/zopenbsd.c		ppp_deflate | ipsec | crypto
 file lib/libz/trees.c			ppp_deflate | ipsec | crypto
 file lib/libz/compress.c		ppp_deflate | ipsec | crypto
 
+# Sean Manson Assignment 3 ethernet over UDP
+pseudo-device eou: ifnet, ether
+file net/if_eou.c			eou			needs-count

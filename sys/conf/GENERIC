@@ -111,3 +111,6 @@ pseudo-device	bio	1	# ioctl multiplexing device
 pseudo-device	fuse		# fuse device
 
 option		BOOT_CONFIG	# add support for boot -c
+
+# Sean Manson Assignment 3 eou
+pseudo-device	eou		# Ethernet over UDP
