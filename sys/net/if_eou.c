@@ -19,23 +19,31 @@
 
 #include <net/if_eou.h>
 
+/* TODO: socket list */
+SLIST_HEAD(, eou_softc) eou_sclist;
+
 void	eouattach(int);
 int	eou_clone_create(struct if_clone *, int);
 int	eou_clone_destroy(struct ifnet *);
 int	eouioctl(struct ifnet *, u_long, caddr_t);
 void	eoustart(struct ifnet *);
+int	eououtput(struct ifnet *, struct mbuf *, struct sockaddr *,
+	    struct rtentry *);
 int	eou_media_change(struct ifnet *);
 void	eou_media_status(struct ifnet *, struct ifmediareq *);
-int	eou_config(struct ifnet *, struct sockaddr *, struct sockaddr *);
+int	eou_set_address(struct ifnet *, struct sockaddr *, struct sockaddr *);
+int	eou_sock_create(struct ifnet *);
+int	eou_sock_delete(struct ifnet *);
 
 struct if_clone	eou_cloner =
     IF_CLONE_INITIALIZER("eou", eou_clone_create, eou_clone_destroy);
-
 
 void
 eouattach(int neou)
 {
 	printf("eouattach\n");
+	SLIST_INIT(&eou_sclist);
+
 	if_clone_attach(&eou_cloner);
 }
 
@@ -46,8 +54,7 @@ eou_clone_create(struct if_clone *ifc, int unit)
 	struct eou_softc	*sc;
 	
 	printf("creating eou clone\n");
-	if ((sc = malloc(sizeof(*sc),
-	    M_DEVBUF, M_NOWAIT|M_ZERO)) == NULL)
+	if ((sc = malloc(sizeof(*sc), M_DEVBUF, M_NOWAIT|M_ZERO)) == NULL)
 		return (ENOMEM);
 
 	/* basic address info settings */
@@ -60,6 +67,7 @@ eou_clone_create(struct if_clone *ifc, int unit)
 	
 	/* softnet defaults */
 	sc->sc_dstport = htons(EOU_PORT);
+	sc->sc_s = NULL;
 	sc->sc_network = 0;
 
 	/* send queue */
@@ -69,6 +77,7 @@ eou_clone_create(struct if_clone *ifc, int unit)
 	/* handlers */
 	ifp->if_ioctl = eouioctl;
 	ifp->if_start = eoustart;
+	ifp->if_output = eououtput;
 
 	/* media */
 	ifmedia_init(&sc->sc_media, 0, eou_media_change, eou_media_status);
@@ -77,6 +86,9 @@ eou_clone_create(struct if_clone *ifc, int unit)
 
 	if_attach(ifp);
 	ether_ifattach(ifp);
+
+	/* add to overall list */
+	SLIST_INSERT_HEAD(&eou_sclist, sc, sc_next);
 	return (0);
 }
 
@@ -84,38 +96,32 @@ int
 eou_clone_destroy(struct ifnet *ifp)
 {
 	struct eou_softc	*sc = ifp->if_softc;
+	int s, error = 0;
 
 	printf("destroying eou clone\n");
+	s = splnet();
+	/* remove socket */
+	error = eou_sock_delete(ifp);
+	if (error != 0)
+		goto end;
+	
+	/* remove sub structures */
 	ifmedia_delete_instance(&sc->sc_media, IFM_INST_ANY);
 	ether_ifdetach(ifp);
 	if_detach(ifp);
+
+	/* remove main structures */
+	SLIST_REMOVE(&eou_sclist, sc, eou_softc, sc_next);
 	free(sc, M_DEVBUF, sizeof(*sc));
-	return (0);
+
+end:
+	splx(s);
+	return error;
 }
 
 /*
- * The bridge has magically already done all the work for us,
- * and we only need to discard the packets.
+ * Handle IO commands given to us by ifconfig.
  */
-void
-eoustart(struct ifnet *ifp)
-{
-	struct mbuf		*m;
-	int			 s;
-
-	printf("eou started\n");
-	for (;;) {
-		s = splnet();
-		IFQ_DEQUEUE(&ifp->if_snd, m);
-		splx(s);
-
-		if (m == NULL)
-			return;
-		ifp->if_opackets++;
-		m_freem(m);
-	}
-}
-
 /* ARGSUSED */
 int
 eouioctl(struct ifnet *ifp, u_long cmd, caddr_t data)
@@ -136,16 +142,15 @@ eouioctl(struct ifnet *ifp, u_long cmd, caddr_t data)
 		/* FALLTHROUGH */
 
 	case SIOCSIFFLAGS:
-		printf("ioctl FLAGS\n");
-		if (ifp->if_flags & IFF_UP) {
+		if ((ifp->if_flags & IFF_UP) && sc->sc_s != NULL) {
 			ifp->if_flags |= IFF_RUNNING;
-		} else {
+		} else
 			ifp->if_flags &= ~IFF_RUNNING;
-		}
 		break;
-
+		
 	case SIOCADDMULTI:
 	case SIOCDELMULTI:
+		/* should be already handled */
 		break;
 
 	case SIOCGIFMEDIA:
@@ -158,7 +163,7 @@ eouioctl(struct ifnet *ifp, u_long cmd, caddr_t data)
 		if ((error = suser(p, 0)) != 0)
 			break;
 		s = splnet();
-		error = eou_config(ifp,
+		error = eou_set_address(ifp,
 		    (struct sockaddr *)&lifr->addr,
 		    (struct sockaddr *)&lifr->dstaddr);
 		splx(s);
@@ -169,22 +174,20 @@ eouioctl(struct ifnet *ifp, u_long cmd, caddr_t data)
 		if ((error = suser(p, 0)) != 0)
 			break;
 		s = splnet();
-		bzero(&sc->sc_src, sizeof(sc->sc_src));
-		bzero(&sc->sc_dst, sizeof(sc->sc_dst));
-		sc->sc_dstport = htons(EOU_PORT);
+		error = eou_set_address(ifp, NULL, NULL);
 		splx(s);
 		break;
 
 	case SIOCGLIFPHYADDR:
 		printf("ioctl getting addr\n");
-		if (sc->sc_dst.ss_family == AF_UNSPEC) {
-			error = EADDRNOTAVAIL;
-			break;
+		if (sc->sc_s == NULL) {
+			error = ether_ioctl(ifp, &sc->sc_ac, cmd, data);
+			break; /* socket only exists if tunnel exists */
 		}
 		bzero(&lifr->addr, sizeof(lifr->addr));
 		bzero(&lifr->dstaddr, sizeof(lifr->dstaddr));
-		memcpy(&lifr->addr, &sc->sc_src, sc->sc_src.ss_len);
-		memcpy(&lifr->dstaddr, &sc->sc_dst, sc->sc_dst.ss_len);
+		memcpy(&lifr->addr, &sc->sc_src, sizeof(&sc->sc_src));
+		memcpy(&lifr->dstaddr, &sc->sc_dst, sizeof(&sc->sc_dst));
 		break;
 
 	case SIOCSVNETID:
@@ -197,7 +200,7 @@ eouioctl(struct ifnet *ifp, u_long cmd, caddr_t data)
 		}
 		s = splnet();
 		sc->sc_network = (uint32_t)ifr->ifr_vnetid;
-		(void)eou_config(ifp, NULL, NULL);
+		error = eou_set_address(ifp, NULL, NULL);
 		splx(s);
 		break;
 
@@ -214,6 +217,86 @@ eouioctl(struct ifnet *ifp, u_long cmd, caddr_t data)
 	return (error);
 }
 
+/*
+ * The bridge has magically already done all the work for us,
+ * and we only need to discard the packets.
+ */
+void
+eoustart(struct ifnet *ifp)
+{
+	struct eou_softc *sc = (struct eou_softc *)ifp;
+	struct mbuf		*m;
+	int			 s;
+
+	printf("eou started\n");
+	while (1) {
+		/* get packets until none remain */
+		s = splnet();
+		IFQ_DEQUEUE(&ifp->if_snd, m);
+		splx(s);
+		if (m == NULL)
+			break;
+
+		/* ensure usable */	
+		if ((ifp->if_flags & (IFF_OACTIVE | IFF_UP)) != IFF_UP ||
+		    sc->sc_s == NULL) {
+			printf("skipping mbuf - not usable\n");
+			m_freem(m);
+			continue;
+		}
+		
+		/* increment sent packets */
+		ifp->if_opackets++;
+		
+		/* actually send packet */
+		printf("sending mbuf\n");
+		/* TODO */
+		m_freem(m);
+	}
+}
+
+
+int
+eououtput(struct ifnet *ifp, struct mbuf *m, struct sockaddr *dst,
+    struct rtentry *rt)
+{
+	struct eou_softc *sc = (struct eou_softc*)ifp;
+	int error = 0;
+	int s;
+
+	printf("eououtput\n");
+	if (!(ifp->if_flags & IFF_UP) || sc->sc_s == NULL) {
+		m_freem(m);
+		error = ENETDOWN;
+		goto end;
+	}
+
+	/*
+	 * Add headers etc.
+	 * TODO
+	 */
+
+	/*
+	 * Queue message on interface, and start output.
+	 */
+	printf("queueing mbuf\n");
+	s = splnet();
+	IFQ_ENQUEUE(&ifp->if_snd, m, NULL, error);
+	if (error) {
+		/* mbuf is already freed */
+		splx(s);
+		goto end;
+	}
+	ifp->if_obytes += m->m_pkthdr.len;
+	if_start(ifp);
+	splx(s);
+
+end:
+	if (error)
+		ifp->if_oerrors++;
+	return (error);
+}
+
 /* MEDIA COMMANDS */	
 int
 eou_media_change(struct ifnet *ifp)
@@ -224,45 +307,88 @@ eou_media_change(struct ifnet *ifp)
 void
 eou_media_status(struct ifnet *ifp, struct ifmediareq *imr)
 {
-	/* only say valid once a connection is running */
-	imr->ifm_active = IFM_ETHER | IFM_AUTO;
 	imr->ifm_status = IFM_AVALID;
 }
 
 /* HELPER COMMANDS */	
+/*
+ * Set up the source and destination addresses as given, as well as the port.
+ * Updates the socket as neccessary to match this information
+ */
 int
-eou_config(struct ifnet *ifp, struct sockaddr *src, struct sockaddr *dst)
+eou_set_address(struct ifnet *ifp, struct sockaddr *src, struct sockaddr *dst)
 {
 	struct eou_softc	*sc = (struct eou_softc *)ifp->if_softc;
 	struct sockaddr_in	*src4, *dst4;
-	int			 reset = 0;
+	int error = 0;
 
-	if (src != NULL && dst != NULL) {
-		/* XXX inet6 is not supported */
+	if (src != NULL && dst != NULL) { /* setting new config */
+		/* inet6 is not supported */
 		if (src->sa_family != AF_INET || dst->sa_family != AF_INET)
 			return (EAFNOSUPPORT);
-	} else {
-		/* Reset current configuration */
-		src = (struct sockaddr *)&sc->sc_src;
-		dst = (struct sockaddr *)&sc->sc_dst;
-		reset = 1;
-	}
 
-	src4 = satosin(src);
-	dst4 = satosin(dst);
+		/* get ipv4 addreses */
+		src4 = satosin(src);
+		dst4 = satosin(dst);
+		if (src4->sin_len != sizeof(*src4) ||
+		    dst4->sin_len != sizeof(*dst4))
+			return (EINVAL);
 
-	if (src4->sin_len != sizeof(*src4) || dst4->sin_len != sizeof(*dst4))
-		return (EINVAL);
+		/* ensure port can be set */
+		if (dst4->sin_port)
+			sc->sc_dstport = dst4->sin_port;
+		else
+			sc->sc_dstport = htons(EOU_PORT);
 
-	if (dst4->sin_port)
-		sc->sc_dstport = dst4->sin_port;
+		/* delete socket if present */
+		if (sc->sc_s != NULL)
+			error = eou_sock_delete(ifp);
+		if (error != 0)
+			goto end;
 
-	if (!reset) {
+		/* reset */
 		bzero(&sc->sc_src, sizeof(sc->sc_src));
 		bzero(&sc->sc_dst, sizeof(sc->sc_dst));
 		memcpy(&sc->sc_src, src, src->sa_len);
 		memcpy(&sc->sc_dst, dst, dst->sa_len);
+
+		/* create socket */
+		error = eou_sock_create(ifp);
+	} else { /* just delete old config */
+		/* delete socket if present */
+		if (sc->sc_s != NULL)
+			error = eou_sock_delete(ifp);
+		if (error != 0)
+			goto end;
+		
+		/* reset */
+		bzero(&sc->sc_src, sizeof(sc->sc_src));
+		bzero(&sc->sc_dst, sizeof(sc->sc_dst));
 	}
 
-	return (0);
+end:
+	return error;
+}
+
+/*
+ * Create a new socket* to match the internal structures on this ifp, or
+ * simply update it to match a previous one if one already exists for these
+ * addresses.
+ */
+int
+eou_sock_create(struct ifnet *ifp)
+{
+	/* TODO */
+	return 0;
+}
+
+/*
+ * Delete and free the socket for this ifp matching the given addresses, or
+ * simply set to null if it is currently referenced by other things.
+ */
+int
+eou_sock_delete(struct ifnet *ifp)
+{
+	/* TODO */
+	return 0;
 }

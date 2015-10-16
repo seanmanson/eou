@@ -33,15 +33,19 @@ struct eou_softc {
 
 	uint32_t		 sc_network;	/* address of this eou */
 
-	struct sockaddr_storage	 sc_src;	/* this address */
-	struct sockaddr_storage	 sc_dst;	/* server address */
+	struct sockaddr_in	 sc_src;	/* this address */
+	struct sockaddr_in	 sc_dst;	/* server address */
 	in_port_t		 sc_dstport;	/* server port */
-	
-	/*struct ip_moptions	 sc_imo;
-	void			*sc_ahcookie;
-	void			*sc_lhcookie;
-	void			*sc_dhcookie;*/
-};
 
+	/*
+	 * Each cloned interface may point to multiple of the same
+	 * socket if the addresses and port are the same. Before closing/
+	 * opening sockets we check to see if any other interfaces already
+	 * have one with the addresses needed.
+	 */
+	struct socket		*sc_s;		/* socket for this */
+	
+	SLIST_ENTRY(eou_softc)	sc_next; /* list of all eous */
+};
 
 #endif /* _NET_EOU_H */
