@@ -8,6 +8,7 @@
 #include <sys/mbuf.h>
 #include <sys/socket.h>
 #include <sys/sockio.h>
+#include <sys/socketvar.h>
 #include <sys/ioctl.h>
 
 #include <net/if.h>
@@ -25,18 +26,25 @@ SLIST_HEAD(, eou_softc) eou_sclist;
 void	eouattach(int);
 int	eou_clone_create(struct if_clone *, int);
 int	eou_clone_destroy(struct ifnet *);
+
 int	eouioctl(struct ifnet *, u_long, caddr_t);
 void	eoustart(struct ifnet *);
 int	eououtput(struct ifnet *, struct mbuf *, struct sockaddr *,
 	    struct rtentry *);
+void	eourecv(struct socket *, caddr_t, int);
 int	eou_media_change(struct ifnet *);
 void	eou_media_status(struct ifnet *, struct ifmediareq *);
+
 int	eou_set_address(struct ifnet *, struct sockaddr *, struct sockaddr *);
 int	eou_sock_create(struct ifnet *);
 int	eou_sock_delete(struct ifnet *);
+void	eou_timeout_ping(void *);
+void	eou_timeout_pong(void *);
 
+/* globals */
 struct if_clone	eou_cloner =
     IF_CLONE_INITIALIZER("eou", eou_clone_create, eou_clone_destroy);
+
 
 void
 eouattach(int neou)
@@ -69,6 +77,10 @@ eou_clone_create(struct if_clone *ifc, int unit)
 	sc->sc_dstport = htons(EOU_PORT);
 	sc->sc_s = NULL;
 	sc->sc_network = 0;
+
+	/* timeouts */
+	timeout_set(&sc->sc_pingtmo, eou_timeout_ping, &sc);
+	timeout_set(&sc->sc_pongtmo, eou_timeout_pong, &sc);
 
 	/* send queue */
 	IFQ_SET_MAXLEN(&ifp->if_snd, IFQ_MAXLEN);
@@ -131,7 +143,7 @@ eouioctl(struct ifnet *ifp, u_long cmd, caddr_t data)
 	struct ifreq		*ifr = (struct ifreq *)data;
 	struct if_laddrreq	*lifr = (struct if_laddrreq *)data;
 	struct proc		*p = curproc;
-	int			 error = 0, s;
+	int			 s, error = 0;
 
 	switch (cmd) {
 	case SIOCSIFADDR:
@@ -218,15 +230,14 @@ eouioctl(struct ifnet *ifp, u_long cmd, caddr_t data)
 }
 
 /*
- * The bridge has magically already done all the work for us,
- * and we only need to discard the packets.
+ * Start sending queued packets for this interface.
  */
 void
 eoustart(struct ifnet *ifp)
 {
 	struct eou_softc *sc = (struct eou_softc *)ifp;
-	struct mbuf		*m;
-	int			 s;
+	struct mbuf *m;
+	int s;
 
 	printf("eou started\n");
 	while (1) {
@@ -261,8 +272,7 @@ eououtput(struct ifnet *ifp, struct mbuf *m, struct sockaddr *dst,
     struct rtentry *rt)
 {
 	struct eou_softc *sc = (struct eou_softc*)ifp;
-	int error = 0;
-	int s;
+	int s, error = 0;
 
 	printf("eououtput\n");
 	if (!(ifp->if_flags & IFF_UP) || sc->sc_s == NULL) {
@@ -297,6 +307,43 @@ end:
 	return (error);
 }
 
+/*
+ * Receive a response on a socket.
+ */
+void
+eourecv(struct socket *so, caddr_t upcallarg, int waitflag)
+{
+	struct mbuf	 *recv;
+	struct eou_softc *sc = (struct eou_softc *)upcallarg;
+	int s, error = 0, flag = (waitflag == M_DONTWAIT) ? MSG_DONTWAIT : 0;
+
+	s = splnet();
+	printf("got packet response\n");
+	
+	/* prevent receiving on a deleted socket */
+	if (so == NULL || sc->sc_s == NULL) {
+		printf("socket had been deleted - ignoring\n");
+		goto end;	
+	}
+
+
+	error = soreceive(so, NULL, NULL, &recv, NULL, &flag, 0);
+	if (error != 0) {
+		printf("error receiving packet: %d\n", error);
+		goto end;
+	}
+
+	/* parse packet */
+	/*TODO*/
+
+	/* hand parsed packet up a layer */
+	/* TODO */
+end:
+	printf("finished handling res\n");
+	splx(s);
+	return;
+}
+
 /* MEDIA COMMANDS */	
 int
 eou_media_change(struct ifnet *ifp)
@@ -313,7 +360,8 @@ eou_media_status(struct ifnet *ifp, struct ifmediareq *imr)
 /* HELPER COMMANDS */	
 /*
  * Set up the source and destination addresses as given, as well as the port.
- * Updates the socket as neccessary to match this information
+ * Updates the socket as neccessary to match this information.
+ * Must be called within splnet.
  */
 int
 eou_set_address(struct ifnet *ifp, struct sockaddr *src, struct sockaddr *dst)
@@ -354,6 +402,9 @@ eou_set_address(struct ifnet *ifp, struct sockaddr *src, struct sockaddr *dst)
 
 		/* create socket */
 		error = eou_sock_create(ifp);
+
+		/* successfully connected; set up */
+		if_up(ifp);
 	} else { /* just delete old config */
 		/* delete socket if present */
 		if (sc->sc_s != NULL)
@@ -364,6 +415,9 @@ eou_set_address(struct ifnet *ifp, struct sockaddr *src, struct sockaddr *dst)
 		/* reset */
 		bzero(&sc->sc_src, sizeof(sc->sc_src));
 		bzero(&sc->sc_dst, sizeof(sc->sc_dst));
+
+		/* not connected now; set down */
+		if_down(ifp);
 	}
 
 end:
@@ -374,21 +428,109 @@ end:
  * Create a new socket* to match the internal structures on this ifp, or
  * simply update it to match a previous one if one already exists for these
  * addresses.
+ * Must be called within splnet.
  */
 int
 eou_sock_create(struct ifnet *ifp)
 {
-	/* TODO */
-	return 0;
+	struct socket		*s;
+	struct sockaddr		*sa;
+	struct mbuf		*m;
+	struct eou_softc	*sc = (struct eou_softc *)ifp->if_softc;
+	int error = 0;
+
+	/* Determine if socket already exists */
+	/*TODO*/
+
+	/* Otherwise, create socket */
+	printf("creating new socket\n");
+	error = socreate(AF_INET, &s, SOCK_DGRAM, 0);
+	if (error)
+		return (error);
+
+	/* Bind */
+	MGET(m, M_WAITOK, MT_SONAME);
+	m->m_len = sizeof(sc->sc_src);
+	sa = mtod(m, struct sockaddr *);
+	memcpy(sa, &sc->sc_src, sizeof(sc->sc_src));
+
+	error = sobind(s, m, curproc);
+	m_freem(m);
+	if (error) {
+		soclose(s);
+		return (error);
+	}
+
+	/* Connect */
+	/*MGET(m, M_WAITOK, MT_SONAME);
+	m->m_len = sizeof(sc->sc_dst);
+	sa = mtod(m, struct sockaddr *);
+	memcpy(sa, &sc->sc_dst, sizeof(sc->sc_dst));
+
+	error = soconnect(s, m);
+	m_freem(m);
+	if (error) {
+		soclose(s);
+		return (error);
+	}*/
+
+
+	/* Socket settings */
+	printf("created/assigned socket soccessfully\n");
+	s->so_upcallarg = (caddr_t)sc;
+	s->so_upcall = eourecv; /* TODO: match to multiple values */
+	sc->sc_s = s;
+
+	return (0);
 }
 
 /*
  * Delete and free the socket for this ifp matching the given addresses, or
  * simply set to null if it is currently referenced by other things.
+ * Must be called within splnet.
  */
 int
 eou_sock_delete(struct ifnet *ifp)
 {
+	struct eou_softc	*sc = (struct eou_softc *)ifp->if_softc;
+	struct socket		*s;
+
+	printf("deleting socket\n");
+
+	/* update pointers */
+	s = sc->sc_s;
+	s->so_upcall = NULL;
+	sc->sc_s = NULL;
+
+	/* close socket */
+	soclose(s);
+
 	/* TODO */
-	return 0;
+	return (0);
+}
+
+/*
+ * Timer fires for sending a ping every 30 seconds.
+ */
+void
+eou_timeout_ping(void *arg)
+{
+	struct eou_softc	*sc = arg;
+
+	/* TODO */
+	printf("ping timeout fired\n");
+	timeout_add_sec(&sc->sc_pingtmo, EOU_PING_TIMEOUT);
+}
+
+/*
+ * Timer fires when we fail to receive a server pong for 100 seconds
+ */
+void
+eou_timeout_pong(void *arg)
+{
+	struct eou_softc	*sc = arg;
+
+	/* TODO */
+	printf("pong timeout fired\n");
+	timeout_add_sec(&sc->sc_pongtmo, EOU_PONG_TIMEOUT);
 }

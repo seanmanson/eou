@@ -7,6 +7,8 @@
 #define _NET_EOU_H
 
 #define EOU_PORT		3301
+#define EOU_PING_TIMEOUT	30
+#define EOU_PONG_TIMEOUT	100
 
 struct eou_header {
 	uint32_t		eou_network;
@@ -25,13 +27,15 @@ struct eou_pingpong {
 	uint8_t			mac[8];
 } __packed;
 
-
 /* softnet struct for eou comms */
 struct eou_softc {
 	struct arpcom		 sc_ac;
 	struct ifmedia		 sc_media;
 
 	uint32_t		 sc_network;	/* address of this eou */
+
+	struct timeout		 sc_pingtmo;	/* tmo for sending pings */
+	struct timeout		 sc_pongtmo;	/* tmo for getting pongs */
 
 	struct sockaddr_in	 sc_src;	/* this address */
 	struct sockaddr_in	 sc_dst;	/* server address */
