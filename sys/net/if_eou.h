@@ -9,6 +9,9 @@
 #define EOU_PORT		3301
 #define EOU_PING_TIMEOUT	30
 #define EOU_PONG_TIMEOUT	100
+#define EOU_KEY			{0x63, 0x6f, 0x6d, 0x70, 0x33, 0x33, 0x30, \
+				 0x31, 0x63, 0x6f, 0x6d, 0x70, 0x37, 0x33, \
+				 0x30, 0x38}
 
 struct eou_header {
 	uint32_t		eou_network;
@@ -24,22 +27,23 @@ struct eou_pingpong {
 	uint16_t		_pad;
 	uint64_t		utime;
 	uint8_t			random[32];
-	uint8_t			mac[8];
+	uint8_t			mac[SIPHASH_DIGEST_LENGTH];
 } __packed;
 
 /* softnet struct for eou comms */
 struct eou_softc {
+	struct ifnet		*sc_ifp;
 	struct arpcom		 sc_ac;
 	struct ifmedia		 sc_media;
+
+	struct mbuf_queue	 sc_mq;		/* all packets queued to send*/
+	struct task		 sc_sndt;	/* task for sending above */
 
 	uint32_t		 sc_network;	/* address of this eou */
 
 	struct timeout		 sc_pingtmo;	/* tmo for sending pings */
 	struct timeout		 sc_pongtmo;	/* tmo for getting pongs */
-
-	struct sockaddr_in	 sc_src;	/* this address */
-	struct sockaddr_in	 sc_dst;	/* server address */
-	in_port_t		 sc_dstport;	/* server port */
+	int			 sc_gotpong;	/* got pong in last 100s? */
 
 	/*
 	 * Each cloned interface may point to multiple of the same
@@ -47,6 +51,10 @@ struct eou_softc {
 	 * opening sockets we check to see if any other interfaces already
 	 * have one with the addresses needed.
 	 */
+	struct sockaddr_in	 sc_src;	/* this address */
+	struct sockaddr_in	 sc_dst;	/* server address */
+	in_port_t		 sc_dstport;	/* server port */
+
 	struct socket		*sc_s;		/* socket for this */
 	
 	SLIST_ENTRY(eou_softc)	sc_next; /* list of all eous */
