@@ -7,7 +7,7 @@
 #define _NET_EOU_H
 
 #define EOU_PORT		3301
-#define EOU_PING_TIMEOUT	30
+#define EOU_PING_TIMEOUT	5
 #define EOU_PONG_TIMEOUT	100
 #define EOU_KEY			{0x63, 0x6f, 0x6d, 0x70, 0x33, 0x33, 0x30, \
 				 0x31, 0x63, 0x6f, 0x6d, 0x70, 0x37, 0x33, \
@@ -38,10 +38,12 @@ struct eou_softc {
 
 	struct mbuf_queue	 sc_mq;		/* all packets queued to send*/
 	struct task		 sc_sndt;	/* task for sending above */
+	struct task		 sc_rect;	/* task for getting data */
 
 	uint32_t		 sc_network;	/* address of this eou */
 
 	struct timeout		 sc_pingtmo;	/* tmo for sending pings */
+	struct task		 sc_pingt; 	/* task for sending pings */
 	struct timeout		 sc_pongtmo;	/* tmo for getting pongs */
 	int			 sc_gotpong;	/* got pong in last 100s? */
 

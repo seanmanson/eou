@@ -33,6 +33,7 @@ int	eou_clone_destroy(struct ifnet *);
 
 int	eouioctl(struct ifnet *, u_long, caddr_t);
 void	eoustart(struct ifnet *);
+void	eouping(void *);
 void	eousend(void *);
 void	eourecv(struct socket *, caddr_t, int);
 int	eou_media_change(struct ifnet *);
@@ -66,7 +67,7 @@ eou_clone_create(struct if_clone *ifc, int unit)
 {
 	struct ifnet		*ifp;
 	struct eou_softc	*sc;
-	
+
 	printf("creating eou clone\n");
 	if ((sc = malloc(sizeof(*sc), M_DEVBUF, M_NOWAIT|M_ZERO)) == NULL)
 		return (ENOMEM);
@@ -83,6 +84,7 @@ eou_clone_create(struct if_clone *ifc, int unit)
 	sc->sc_ifp = ifp;
 	mq_init(&sc->sc_mq, 50, IPL_NET);
 	task_set(&sc->sc_sndt, eousend, sc);
+	task_set(&sc->sc_pingt, eouping, sc);
 	sc->sc_dstport = 0;
 	sc->sc_s = NULL;
 	sc->sc_network = 0;
@@ -239,6 +241,63 @@ eouioctl(struct ifnet *ifp, u_long cmd, caddr_t data)
 }
 
 /*
+ * Send a new ping message to the server.
+ */
+void
+eouping(void *arg)
+{
+	struct eou_softc	*sc = arg;
+	/*struct eou_pingpong	 msg;*/
+	struct mbuf		*m;
+	/*int s, i;*/
+
+	if (sc->sc_s == NULL)
+		return;
+
+
+	/* Connect */
+	MGETHDR(m, M_WAIT, MT_DATA);
+	m->m_len = 0;
+	m->m_pkthdr.len = 0;
+	m_copyback(m, 0, 7, "helpme", M_WAIT);
+	
+	sosend(sc->sc_s, NULL, NULL, m, NULL, 0);
+
+	/* create ping message */
+	/*msg.hdr.eou_network = htonl(sc->sc_network);
+	msg.hdr.eou_type = htons(EOU_T_PING);
+	s = splclock();
+	msg.utime = htobe64((uint64_t)time_second);
+	splx(s);
+	arc4random_buf(msg.random, sizeof(msg.random));
+	eou_gen_mac(&msg, msg.mac);
+
+	printf("creating new message:\n");
+	printf("rand bytes: ");
+	for (i = 0; i < sizeof(msg.random); i++) {
+		printf("%x ", msg.random[i]);
+	}
+	printf("\nmac gen: ");
+	for (i = 0; i < SIPHASH_DIGEST_LENGTH; i++) {
+		printf("%x ", msg.mac[i]);
+	}
+	printf("\n\n");*/
+
+	/* add to send queue */
+	/*MGETHDR(m, M_WAITOK, MT_DATA);
+	m->m_len = 0;
+	m->m_pkthdr.len = 0;
+	m_copyback(m, 0, sizeof(msg), &msg, M_WAITOK);
+
+	if (mq_enqueue(&sc->sc_mq, m) == 0)
+		task_add(systq, &sc->sc_sndt);
+	else {*/
+		/* TODO: add to fails */
+		/*m_freem(m);
+	}*/
+}
+
+/*
  * Start sending queued packets for this interface.
  */
 void
@@ -273,6 +332,45 @@ eoustart(struct ifnet *ifp)
 			/* TODO: increment errors */
 			m_freem(m);
 		}
+	}
+}
+
+/*
+ * Send our entire queue of mbufs to the socket in a process context.
+ */
+void
+eousend(void *arg)
+{
+	struct eou_softc	*sc = arg;
+	struct mbuf_list	 ml;
+	struct mbuf		*m;
+
+	printf("eousend!\n");
+
+	/* get address to send to */
+
+	/* convert from queue to a list to write */
+	mq_delist(&sc->sc_mq, &ml);
+
+	/* write all of these, so long as our socket is valid */
+	while ((m = ml_dequeue(&ml)) != NULL) {
+		printf("eousend new mbuf\n");
+		if (sc->sc_s == NULL) {
+			/* TODO: error count */
+			/*m_freem(m);*/
+			continue;
+		}
+
+		if (sosend(sc->sc_s, NULL, NULL, m, NULL, MSG_NOSIGNAL) != 0) {
+			/*TODO: error count */
+			printf("eousend fail\n");
+			/*m_freem(m);*/
+			continue;
+		}
+
+		/* Increment sent packet count */
+		sc->sc_ifp->if_opackets++;
+		/*m_freem(m);*/
 	}
 }
 
@@ -313,42 +411,6 @@ end:
 	return;
 }
 
-/*
- * Send our entire queue of mbufs to the socket in a process context.
- */
-void
-eousend(void *arg)
-{
-	struct eou_softc	*sc = arg;
-	struct mbuf_list	 ml;
-	struct mbuf		*m;
-
-	printf("eousend!\n");
-
-	/* convert from queue to a list to write */
-	mq_delist(&sc->sc_mq, &ml);
-
-	/* write all of these, so long as our socket is valid */
-	while ((m = ml_dequeue(&ml)) != NULL) {
-		printf("eousend new mbuf\n");
-		if (sc->sc_s != NULL) {
-			/* TODO: error count */
-			m_freem(m);
-			continue;
-		}
-
-		if (sosend(sc->sc_s, NULL, NULL, m, NULL, MSG_NOSIGNAL) != 0) {
-			/*TODO: error count */
-			printf("eousend fail\n");
-			m_freem(m);
-			continue;
-		}
-
-		/* Increment sent packet count */
-		sc->sc_ifp->if_opackets++;
-		m_freem(m);
-	}
-}
 
 /* MEDIA COMMANDS */	
 int
@@ -392,6 +454,8 @@ eou_set_address(struct ifnet *ifp, struct sockaddr_in *src,
 			return (EINVAL);
 
 		/* set relevant port */
+		if (!dst->sin_port)
+			dst->sin_port = htons(EOU_PORT);
 
 		/* create a new socket to match */
 		error = eou_sock_create(src, dst, &new);
@@ -407,10 +471,7 @@ eou_set_address(struct ifnet *ifp, struct sockaddr_in *src,
 		bzero(&sc->sc_dst, sizeof(sc->sc_dst));
 		memcpy(&sc->sc_src, src, src->sin_len);
 		memcpy(&sc->sc_dst, dst, dst->sin_len);
-		if (dst->sin_port)
-			sc->sc_dstport = dst->sin_port;
-		else
-			sc->sc_dstport = htons(EOU_PORT);
+		sc->sc_dstport = dst->sin_port;
 		sc->sc_s = new;
 		sc->sc_s->so_upcallarg = (caddr_t)sc;
 		sc->sc_s->so_upcall = eourecv;
@@ -464,12 +525,14 @@ eou_sock_create(struct sockaddr_in *src, struct sockaddr_in *dst,
 
 	/* Otherwise, create socket */
 	printf("creating new socket\n");
-	error = socreate(AF_INET, &s, SOCK_DGRAM, 17);
+	error = socreate(AF_INET, &s, SOCK_DGRAM, 0);
 	if (error)
 		return (error);
 
 	/* Bind */
-	MGET(m, M_WAITOK, MT_SONAME);
+	MGET(m, M_NOWAIT, MT_SONAME);
+	if (m == NULL)
+		return (ENOBUFS);
 	m->m_len = src->sin_len;
 	sa = mtod(m, struct sockaddr_in *);
 	memcpy(sa, src, src->sin_len);
@@ -483,18 +546,21 @@ eou_sock_create(struct sockaddr_in *src, struct sockaddr_in *dst,
 	}
 
 	/* Connect */
-	/*MGET(m, M_WAITOK, MT_SONAME);
-	m->m_len = sizeof(sc->sc_dst);
-	sa = mtod(m, struct sockaddr *);
-	memcpy(sa, &sc->sc_dst, sizeof(sc->sc_dst));
-
-	error = soconnect(s, m);
-	m_freem(m);
+	MGETHDR(m, M_NOWAIT, MT_SONAME);
+	m->m_len = 0;
+	m->m_pkthdr.len = 0;
+	error = m_copyback(m, 0, dst->sin_len, dst, M_NOWAIT);
 	if (error) {
 		soclose(s);
 		return (error);
-	}*/
+	}
 
+	printf("connecting socket\n");
+	error = soconnect(s, m);
+	if (error) {
+		soclose(s);
+		return (error);
+	}
 
 	/* Socket settings */
 	printf("created/assigned socket soccessfully\n");
@@ -534,9 +600,6 @@ void
 eou_timeout_ping(void *arg)
 {
 	struct eou_softc	*sc = arg;
-	struct eou_pingpong	 msg, *mp;
-	struct mbuf		*m;
-	int s, i;
 	
 	/* do nothing if socket is no more */
 	if (sc->sc_s == NULL)
@@ -544,40 +607,8 @@ eou_timeout_ping(void *arg)
 
 	printf("ping timeout fired\n");
 
-	/* create ping message */
-	msg.hdr.eou_network = sc->sc_network;
-	msg.hdr.eou_type = htons(EOU_T_PING);
-	s = splclock();
-	msg.utime = (uint64_t)time_second;
-	splx(s);
-	arc4random_buf(msg.random, sizeof(msg.random));
-	eou_gen_mac(&msg, msg.mac);
-
-	printf("creating new message:\n");
-	printf("network id %d, type %x, time %llu\n", msg.hdr.eou_network,
-	    msg.hdr.eou_type, msg.utime);
-	printf("rand bytes: ");
-	for (i = 0; i < sizeof(msg.random); i++) {
-		printf("%x ", msg.random[i]);
-	}
-	printf("\nmac gen: ");
-	for (i = 0; i < SIPHASH_DIGEST_LENGTH; i++) {
-		printf("%x ", msg.mac[i]);
-	}
-	printf("\n\n");
-
-	/* add to send queue */
-	MGET(m, M_WAITOK, MT_DATA);
-	m->m_len = sizeof(msg);
-	mp = mtod(m, struct eou_pingpong *);
-	memcpy(mp, &msg, sizeof(msg));
-
-	if (mq_enqueue(&sc->sc_mq, m) == 0)
-		task_add(systq, &sc->sc_sndt);
-	else {
-		/* TODO: add to fails */
-		m_freem(m);
-	}
+	/* add ping task */
+	task_add(systq, &sc->sc_pingt);
 
 	/* re-add timeout for next message */
 	timeout_add_sec(&sc->sc_pingtmo, EOU_PING_TIMEOUT);
