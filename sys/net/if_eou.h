@@ -7,11 +7,13 @@
 #define _NET_EOU_H
 
 #define EOU_PORT		3301
-#define EOU_PING_TIMEOUT	5
+#define EOU_PING_TIMEOUT	15
 #define EOU_PONG_TIMEOUT	100
 #define EOU_KEY			{0x63, 0x6f, 0x6d, 0x70, 0x33, 0x33, 0x30, \
 				 0x31, 0x63, 0x6f, 0x6d, 0x70, 0x37, 0x33, \
 				 0x30, 0x38}
+#define EOU_MTU			1500
+#define EOU_INTERNAL_MTU	1506
 
 struct eou_header {
 	uint32_t		eou_network;
