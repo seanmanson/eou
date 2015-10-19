@@ -24,7 +24,6 @@
 
 #include <net/if_eou.h>
 
-/* TODO: socket list */
 SLIST_HEAD(, eou_softc) eou_sclist;
 
 void	eouattach(int);
@@ -248,7 +247,7 @@ eouping(void *arg)
 	struct eou_softc	*sc = arg;
 	struct eou_pingpong	 msg;
 	struct mbuf		*m;
-	int s, i;
+	int s;
 
 	if (sc->sc_s == NULL)
 		return;
@@ -262,12 +261,7 @@ eouping(void *arg)
 	arc4random_buf(msg.random, sizeof(msg.random));
 	eou_gen_mac(&msg, msg.mac);
 
-	printf("creating new message:\n");
-	printf("\nmac gen: ");
-	for (i = 0; i < SIPHASH_DIGEST_LENGTH; i++) {
-		printf(" %x", msg.mac[i]);
-	}
-	printf("\n\n");
+	printf("created new ping\n");
 
 	/* add to send queue */
 	MGETHDR(m, M_WAITOK, MT_DATA);
@@ -278,7 +272,7 @@ eouping(void *arg)
 	if (mq_enqueue(&sc->sc_mq, m) == 0)
 		task_add(systq, &sc->sc_sndt);
 	else {
-		/* TODO: add to fails */
+		sc->sc_ifp->if_ierrors++;
 		m_freem(m);
 	}
 }
@@ -298,6 +292,7 @@ eoustart(struct ifnet *ifp)
 		/* get packets until none remain */
 		s = splnet();
 		IFQ_DEQUEUE(&ifp->if_snd, m);
+		ifp->if_ipackets++;
 		splx(s);
 		if (m == NULL) {
 			/* begin sending */
@@ -309,13 +304,14 @@ eoustart(struct ifnet *ifp)
 		if ((ifp->if_flags & (IFF_OACTIVE | IFF_UP)) != IFF_UP ||
 		    sc->sc_s == NULL) {
 			printf("skipping mbuf - not usable\n");
+			ifp->if_ierrors++;
 			m_freem(m);
 			continue;
 		}
 
 		/* add to send queue */
 		/*if (mq_enqueue(&sc->sc_mq, m) != 0)*/ {
-			/* TODO: increment errors */
+			ifp->if_ierrors++;
 			m_freem(m);
 		}
 	}
@@ -330,30 +326,37 @@ eousend(void *arg)
 	struct eou_softc	*sc = arg;
 	struct mbuf_list	 ml;
 	struct mbuf		*m;
-	int err = 0;
+	int s, bytes, err = 0;
 
-	printf("eousend!\n");
+	printf("eousend\n");
 
 	/* convert from queue to a list to write */
+	s = splnet();
 	mq_delist(&sc->sc_mq, &ml);
+	splx(s);
 
 	/* write all of these, so long as our socket is valid */
-	while ((m = ml_dequeue(&ml)) != NULL) {
+	while ((m = ml_dequeue(&ml)) != NULL) {	
+		printf("next packet...\n");
+		/* Increment sent packet count */
+		sc->sc_ifp->if_opackets++;
+
+		/* Prevent sending to closed socket */
 		if (sc->sc_s == NULL) {
-			/* TODO: error count */
+			sc->sc_ifp->if_oerrors++;
 			m_freem(m);
 			continue;
 		}
 
+
+		/* send packet */
+		bytes = m->m_len;
 		err = sosend(sc->sc_s, NULL, NULL, m, NULL, MSG_NOSIGNAL);
 		if (err != 0) {
-			/*TODO: error count */
 			printf("eousend fail: %d\n", err);
-			continue;
-		}
-
-		/* Increment sent packet count */
-		sc->sc_ifp->if_opackets++;
+			sc->sc_ifp->if_oerrors++;
+		} else
+			sc->sc_ifp->if_obytes += bytes;
 	}
 }
 
@@ -371,15 +374,18 @@ eourecv(struct socket *so, caddr_t upcallarg, int waitflag)
 	uint64_t		 truet, utime;
 	uint8_t			 truemac[SIPHASH_DIGEST_LENGTH];
 	uint8_t			 msg[EOU_INTERNAL_MTU];
-	int s, error = 0;
+	int s, bytes, error = 0;
+	int flag = (waitflag == M_DONTWAIT) ? MSG_DONTWAIT : 0;
 	
 	/* time of arrival */
 	s = splclock();
 	truet = (uint64_t)time_second;
 	splx(s);
-
-	s = splnet();
-	printf("got packet response waitflag %d\n", waitflag);
+	
+	/* Get packet res */
+	printf("got packet response waitflag %d len %lu\n", waitflag,
+	    so->so_rcv.sb_cc);
+	sc->sc_ifp->if_ipackets++;
 	
 	/* prevent receiving on a deleted socket */
 	if (so == NULL || sc->sc_s == NULL || so != sc->sc_s ||
@@ -399,26 +405,33 @@ eourecv(struct socket *so, caddr_t upcallarg, int waitflag)
 	auio.uio_rw = UIO_READ;
 
 	/* get packet */
-	error = soreceive(so, NULL, &auio, NULL, NULL, &waitflag, 0);
+	error = soreceive(so, NULL, &auio, NULL, NULL, &flag, 0);
 	printf("send soreceive %d\n", (int)auio.uio_resid);
 	if (error != 0)
 		goto err;
+	bytes = EOU_INTERNAL_MTU - auio.uio_resid;
 
-	/* parse packet */
+	/* parse header */
 	printf("parsing packet\n");
+	if (bytes < sizeof(struct eou_header))
+		goto err;
 	pkt = (struct eou_header *)msg;
 	if (ntohl(pkt->eou_network) != sc->sc_network) {
 		printf("invalid network\n");
 		goto err;
 	}
+
+	/* handle packet */
 	if (ntohs(pkt->eou_type) == EOU_T_PONG) {
 		printf("got pong\n");
 		/* try to parse as a pong */
+		if (bytes < sizeof(struct eou_pingpong))
+			goto err;
 		pp = (struct eou_pingpong *)msg;
 
 		/* check time */
-		printf("checking time\n");
 		utime = betoh64(pp->utime);
+		printf("checking time ttime %llu utime %llu\n", truet, utime);
 		if (utime > truet + 30 || utime < truet - 30)
 			goto err;
 
@@ -438,14 +451,12 @@ eourecv(struct socket *so, caddr_t upcallarg, int waitflag)
 		goto err; /* Unknown/unhandled type */
 
 	/* done */
-	splx(s);
 	printf("packet rec success\n");
 	return;
 
 err:
-	splx(s);
 	printf("error receiving packet: %d\n", error);
-	/* TODO: increase fails */
+	sc->sc_ifp->if_ierrors++;
 }
 
 
