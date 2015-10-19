@@ -32,6 +32,20 @@ struct eou_pingpong {
 	uint8_t			mac[SIPHASH_DIGEST_LENGTH];
 } __packed;
 
+/*	 
+* Each cloned interface may point to multiple of the same
+* socket if the addresses and port are the same. Before closing/
+* opening sockets we check to see if any other interfaces already
+* have one with the addresses needed.
+*/
+struct eou_sock {
+	struct socket		*so_s;		/* udp connected socket */
+	struct sockaddr_in	 so_src;	/* bound address */
+	struct sockaddr_in	 so_dst;	/* server address */
+	
+	SLIST_ENTRY(eou_sock)	 so_next; 	/* list of all eou_sock */
+};
+
 /* softnet struct for eou comms */
 struct eou_softc {
 	struct ifnet		*sc_ifp;
@@ -49,19 +63,9 @@ struct eou_softc {
 	struct timeout		 sc_pongtmo;	/* tmo for getting pongs */
 	int			 sc_gotpong;	/* got pong in last 100s? */
 
-	/*
-	 * Each cloned interface may point to multiple of the same
-	 * socket if the addresses and port are the same. Before closing/
-	 * opening sockets we check to see if any other interfaces already
-	 * have one with the addresses needed.
-	 */
-	struct sockaddr_in	 sc_src;	/* this address */
-	struct sockaddr_in	 sc_dst;	/* server address */
-	in_port_t		 sc_dstport;	/* server port */
-
-	struct socket		*sc_s;		/* socket for this */
+	struct eou_sock		*sc_s;		/* socket for this conn */
 	
-	SLIST_ENTRY(eou_softc)	sc_next; /* list of all eous */
+	SLIST_ENTRY(eou_softc)	 sc_next;	/* list of all eou_softc */
 };
 
 #endif /* _NET_EOU_H */
