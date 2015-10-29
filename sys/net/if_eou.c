@@ -68,14 +68,13 @@ eou_clone_create(struct if_clone *ifc, int unit)
 	struct ifnet		*ifp;
 	struct eou_softc	*sc;
 
-	printf("creating eou clone\n");
 	if ((sc = malloc(sizeof(*sc), M_DEVBUF, M_NOWAIT|M_ZERO)) == NULL)
 		return (ENOMEM);
 
 	/* basic address info settings */
 	ifp = &sc->sc_ac.ac_if;
 	snprintf(ifp->if_xname, sizeof(ifp->if_xname), "eou%d", unit);
-	ifp->if_flags = IFF_SIMPLEX;
+	ifp->if_flags = IFF_SIMPLEX | IFF_BROADCAST | IFF_MULTICAST;
 	ether_fakeaddr(ifp);
 	ifp->if_softc = sc;
 	/*ifp->if_capabilities = IFCAP_VLAN_MTU;*/
@@ -120,7 +119,6 @@ eou_clone_destroy(struct ifnet *ifp)
 	struct eou_softc	*sc = ifp->if_softc;
 	int s, error = 0;
 
-	printf("destroying eou clone\n");
 	s = splnet();
 
 	/* desub */
@@ -146,7 +144,7 @@ eou_clone_destroy(struct ifnet *ifp)
 int
 eouioctl(struct ifnet *ifp, u_long cmd, caddr_t data)
 {
-	struct eou_softc	*sc = (struct eou_softc *)ifp->if_softc;
+	struct eou_softc	*ent, *sc = (struct eou_softc *)ifp->if_softc;
 	struct ifaddr		*ifa = (struct ifaddr *)data;
 	struct ifreq		*ifr = (struct ifreq *)data;
 	struct if_laddrreq	*lifr = (struct if_laddrreq *)data;
@@ -161,9 +159,9 @@ eouioctl(struct ifnet *ifp, u_long cmd, caddr_t data)
 		/* FALLTHROUGH */
 
 	case SIOCSIFFLAGS:
-		if ((ifp->if_flags & IFF_UP) && sc->sc_s != NULL) {
+		if ((ifp->if_flags & IFF_UP) && sc->sc_s != NULL)
 			ifp->if_flags |= IFF_RUNNING;
-		} else
+		else
 			ifp->if_flags &= ~IFF_RUNNING;
 		break;
 		
@@ -214,9 +212,21 @@ eouioctl(struct ifnet *ifp, u_long cmd, caddr_t data)
 			error = EINVAL;
 			break;
 		}
+		if (sc->sc_network == (uint32_t)ifr->ifr_vnetid)
+			break; /* do nothing if setting to self */
+
+		/* check if vnet exists for this socket */
+		SLIST_FOREACH(ent, &eou_sclist, sc_next) {
+			if (ent->sc_network == (uint32_t)ifr->ifr_vnetid) {
+				return (EINVAL);
+			}
+		}
+
+		/* set vnetid */
 		s = splnet();
 		sc->sc_network = (uint32_t)ifr->ifr_vnetid;
-		error = eou_set_address(ifp, NULL, NULL);
+		sc->sc_gotpong = 0;
+		timeout_add_sec(&sc->sc_pingtmo, 1);
 		splx(s);
 		break;
 
@@ -314,7 +324,6 @@ eoustart(struct ifnet *ifp)
 	}
 	
 	/* begin sending */
-	printf("sending packets\n");
 	task_add(systq, &sc->sc_sndt);
 }
 
@@ -377,13 +386,11 @@ eourecv(struct socket *so, caddr_t upcallarg, int waitflag)
 	int flag = (waitflag == M_DONTWAIT) ? MSG_DONTWAIT : 0;
 	
 	/* prevent receiving on a deleted socket */
-	printf("eourecv\n");
 	if (so == NULL || eso->so_s != so ||
 	    (so->so_state & SS_ISCONNECTED) == 0)
 		return;
 
 	/* time of arrival */
-	printf("getting time\n");
 	truet = (uint64_t)time_second;
 	
 	/* setup uio */
@@ -399,20 +406,17 @@ eourecv(struct socket *so, caddr_t upcallarg, int waitflag)
 	auio.uio_rw = UIO_READ;
 
 	/* get packet */
-	printf("soreceive\n");
 	error = soreceive(so, NULL, &auio, NULL, NULL, &flag, 0);
 	if (error != 0)
 		goto err;
 	bytes = EOU_INTERNAL_MTU - auio.uio_resid;
 
 	/* parse header */
-	printf("parsing\n");
 	if (bytes < sizeof(struct eou_header))
 		goto err;
 	pkt = (struct eou_header *)msg;
 
 	/* get sc for network */
-	printf("getting network\n");
 	SLIST_FOREACH(ent, &eou_sclist, sc_next) {
 		if (ent->sc_s != NULL && ent->sc_s == eso &&
 		    ntohl(pkt->eou_network) == ent->sc_network)
@@ -423,9 +427,7 @@ eourecv(struct socket *so, caddr_t upcallarg, int waitflag)
 	sc->sc_ifp->if_ipackets++;
 
 	/* handle packet */
-	printf("handling packet\n");
 	if (ntohs(pkt->eou_type) == EOU_T_PONG) {
-		printf("got pong\n");
 		/* try to parse as a pong */
 		if (bytes < sizeof(struct eou_pingpong))
 			goto err;
@@ -445,7 +447,6 @@ eourecv(struct socket *so, caddr_t upcallarg, int waitflag)
 		sc->sc_gotpong = 1;
 		timeout_add_sec(&sc->sc_pongtmo, EOU_PONG_TIMEOUT);
 	} else if (ntohs(pkt->eou_type) == EOU_T_DATA && sc->sc_gotpong != 0) {
-		printf("got data packet\n");
 		/* strip and convert to mbuf */
 		MGETHDR(data, M_NOWAIT, MT_DATA);
 		if (data == NULL)
@@ -465,13 +466,10 @@ eourecv(struct socket *so, caddr_t upcallarg, int waitflag)
 		splx(s);
 	} else
 		goto err; /* Unknown/unhandled type */
-
 	/* done */
-	printf("packet received\n");
 	return;
 
 err:
-	printf("error receiving packet: %d\n", error);
 	if (sc != NULL)
 		sc->sc_ifp->if_ierrors++;
 }
@@ -537,9 +535,6 @@ eou_set_address(struct ifnet *ifp, struct sockaddr_in *src,
 		/* start ping/pong messages */
 		sc->sc_gotpong = 0;
 		timeout_add_sec(&sc->sc_pingtmo, 1);
-
-		/* successfully tunnelled; set up */
-		if_up(ifp);
 	} else { /* just delete old config */
 		/* remove old timeouts */
 		timeout_del(&sc->sc_pingtmo);
@@ -549,9 +544,6 @@ eou_set_address(struct ifnet *ifp, struct sockaddr_in *src,
 		/* delete socket if present */
 		if (sc->sc_s != NULL)
 			eou_sock_delete(sc);
-		
-		/* not connected now; set down */
-		if_down(ifp);
 	}
 
 end:
@@ -561,8 +553,6 @@ end:
 /*
  * Creates and binds a new socket to match the addresses given.
  * Must be called within splnet.
- *
- * Takes the vnetid of the thing to create a socket for.
  */
 int
 eou_sock_create(struct eou_softc *cur, struct sockaddr_in *src,
@@ -576,7 +566,6 @@ eou_sock_create(struct eou_softc *cur, struct sockaddr_in *src,
 	int error = 0;
 
 	/* Determine if socket already exists */
-	printf("testing if exists\n");
 	SLIST_FOREACH(ent, &eou_socklist, so_next) {
 		if (memcmp(src, &ent->so_src, sizeof(*src)) == 0 &&
 		    memcmp(dst, &ent->so_dst, sizeof(*dst)) == 0) {
@@ -587,8 +576,6 @@ eou_sock_create(struct eou_softc *cur, struct sockaddr_in *src,
 
 	/* If it does, then return it or error if network already exists */
 	if (so != NULL) {
-		printf("found matching existing socket\n");
-
 		/* check if vnet exists for this socket */
 		SLIST_FOREACH(scent, &eou_sclist, sc_next) {
 			if (scent != cur && scent->sc_s == so &&
@@ -596,25 +583,21 @@ eou_sock_create(struct eou_softc *cur, struct sockaddr_in *src,
 				return (EINVAL);
 			}
 		}
-		printf("vnetid is unique\n");
 
 		*new = so;
 		return (0);
 	}
 
 	/* Otherwise, create socket contents */
-	printf("malloc for socket\n");
 	if ((so = malloc(sizeof(*so), M_DEVBUF, M_NOWAIT|M_ZERO)) == NULL)
 		return (ENOMEM);
 
 	/* Create socket */
-	printf("creating new socket\n");
 	error = socreate(AF_INET, &s, SOCK_DGRAM, 0);
 	if (error)
 		goto err;
 
 	/* Bind */
-	printf("binding socket\n");
 	MGET(m, M_NOWAIT, MT_SONAME);
 	if (m == NULL)
 		goto err;
@@ -628,7 +611,6 @@ eou_sock_create(struct eou_softc *cur, struct sockaddr_in *src,
 		goto err;
 
 	/* Connect */
-	printf("connecting socket\n");
 	MGETHDR(m, M_NOWAIT, MT_SONAME);
 	if (m == NULL)
 		goto err;
@@ -643,7 +625,6 @@ eou_sock_create(struct eou_softc *cur, struct sockaddr_in *src,
 		goto err;
 
 	/* Socket struct settings */
-	printf("created/assigned socket soccessfully\n");
 	s->so_upcallarg = (caddr_t)so;
 	s->so_upcall = eourecv;
 	so->so_s = s;
@@ -657,7 +638,6 @@ eou_sock_create(struct eou_softc *cur, struct sockaddr_in *src,
 	return (0);
 	/* NOTREACHED */
 err:
-	printf("error creating socket\n");
 	if (so != NULL)
 		free(so, M_DEVBUF, sizeof(*so));
 	if (s != NULL)
@@ -677,7 +657,6 @@ eou_sock_delete(struct eou_softc *cur)
 {
 	struct eou_softc *ent;
 	struct eou_sock *so;
-	printf("deleting socket\n");
 
 	/* dereference from cur */
 	so = cur->sc_s;
@@ -688,7 +667,6 @@ eou_sock_delete(struct eou_softc *cur)
 		if (ent->sc_s == so)
 			return (0);
 	}
-	printf("no others with this sock, perm\n");
 
 	/* nothing does! delete */
 	so->so_s->so_upcall = NULL;
@@ -714,8 +692,6 @@ eou_timeout_ping(void *arg)
 	if (sc->sc_s == NULL)
 		return;
 
-	printf("ping timeout fired\n");
-
 	/* add ping task */
 	task_add(systq, &sc->sc_pingt);
 
@@ -730,9 +706,7 @@ void
 eou_timeout_pong(void *arg)
 {
 	struct eou_softc	*sc = arg;
-
-	printf("pong timeout fired\n");
-
+	
 	/* No pong message received - we simply say we haven't got one */
 	sc->sc_gotpong = 0;
 }
