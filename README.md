@@ -12,6 +12,8 @@ kept it to themselves).
 separate network IDs, as well as support for different starting ips (if we have multiple connections
 to different networks).
 
+*For more info, see the assignment spec under `assignment3.pdf`*
+
 Usage
 -----
 Create a new `eou` device:
